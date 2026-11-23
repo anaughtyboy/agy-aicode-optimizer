@@ -33,6 +33,23 @@
 
 ---
 
+## 🏗️ 架构全景与工作流程 (v2.5)
+
+```mermaid
+flowchart TD
+    Start["运行 diagnose.sh"] --> Step1["[步骤 1/4] 启动日志分析<br>(扫描最近日志，判定 FetchConfig 激活/降级)"]
+    Step1 --> Step2["[步骤 2/4] 网络握手探测<br>(5s 熔断保护，精确度量 DNS/TLS/总时延)"]
+    Step2 --> Step3["[步骤 3/4] 系统 DNS 归因<br>(跨平台解析，识别 Fake-IP / 真实 IP)"]
+    Step3 --> Step4["[步骤 4/4] 代理控制面白盒透视<br>(自动探测 Clash/Mihomo/Surge REST API)"]
+    Step4 --> Result["输出结论与决策建议<br>(终端人类可读 / --json 供 Agent 消费)"]
+```
+
+### 工具组件清单
+- **`scripts/diagnose.sh`**：统一排障主入口，完成从定性、探测、归因到白盒透视的四步闭环排查；
+- **`scripts/probe_proxy_api.sh`**：零侵入只读探针，直连本地代理控制面，精确还原目标域名命中的分流规则、出口策略组与真实物理节点，并从策略组中推荐 Top 3 低延迟节点。
+
+---
+
 ## 🛠️ 安装与使用
 
 ### 1. 一键安装到 AGY Skills
@@ -59,14 +76,26 @@ bash scripts/diagnose.sh --json
 1. **启动日志检查**：智能分析最近日志中的 FetchConfig 状态，裁决是超时降级（`degraded`）还是成功激活（`healthy`）；
 2. **带熔断的网络探测**：严格探测 `aicode.googleapis.com` 的 DNS/TLS/总耗时，带 5s 超时熔断保护，杜绝挂起与 HTTP 000 假阳性误报；
 3. **系统 DNS 模式归因**：跨平台（dig / getent / nslookup）归因当前解析是处于 Fake-IP 网段还是真实 IP；
-4. **代理控制面白盒透视**：自动发现并只读连接本地 Clash/Mihomo（9090/9097/9091）或 Surge（6171/6170）控制面，透视 `aicode.googleapis.com` 命中的具体分流规则、出口策略组、当前物理节点及最新延迟，并列出同组更低延迟备选节点（支持 `CLASH_SECRET` / `MIHOMO_SECRET` / `SURGE_API_KEY`，未开启时静默优雅降级）。
+4. **代理控制面白盒透视**：自动发现并只读连接本地 Clash/Mihomo（9090/9097/9091）或 Surge（6171/6170）控制面，透视 `aicode.googleapis.com` 命中的具体分流规则、出口策略组、当前物理节点及最新延迟，并列出同组更低延迟备选节点。
+
+### 3. 可选环境变量
+
+探针具备 100% 优雅降级能力，未配置时不影响基础黑盒探测；如需开启深度白盒透视，可按需导出：
+
+| 环境变量 | 作用说明 | 默认值 |
+| :--- | :--- | :--- |
+| `CLASH_SECRET` / `MIHOMO_SECRET` | 本地 Clash / Mihomo 控制面 API 访问密钥 | 空（无鉴权尝试） |
+| `SURGE_API_KEY` | Surge HTTP API 密钥 | 空 |
+| `CLASH_API_URL` / `MIHOMO_API_URL` | 自定义 Clash / Mihomo 控制面地址 | 依次自适应探测 `9090`, `9097`, `9091` |
+| `SURGE_API_URL` | 自定义 Surge 控制面地址 | 依次自适应探测 `6171`, `6170` |
+| `AGY_LOG_DIR` | 自定义 AGY 运行日志路径 | `~/.gemini/antigravity-cli/log` |
 
 ---
 
 ## 🔧 推荐的代理 / DNS 优化配置
 
 > [!IMPORTANT]
-> 在 TUN 模式下绕过 Fake-IP 后，内核仅可见目标 IP。因此配置必须同时满足三要素：**绕过 Fake-IP** + **开启 TLS SNI 嗅探（防止域名规则失效）** + **指定海外防污染 DNS（防止本地解析污染）**。
+> 在 TUN 模式下绕过 Fake-IP 后，内核仅可见目标 IP。因此配置必须同时满足三要素：**绕过 Fake-IP** + **开启 TLS SNI 嗅战（防止域名规则失效）** + **指定海外防污染 DNS（防止本地解析污染）**。
 
 ### 1. Clash / Mihomo 配置
 在配置中补充 `sniffer` 嗅探、`fake-ip-filter` 过滤及 `nameserver-policy` 防污染 DoH：
