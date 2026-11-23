@@ -1,66 +1,165 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "========================================================"
-echo "    AGY & AICode 路由连通性与性能全自动诊断工具"
-echo "========================================================"
-echo ""
+# 强制 C Locale，防止 awk/curl 小数点受系统语言环境影响变为逗号
+export LC_ALL=C
 
-# 1. 查找最新 CLI 日志
-LATEST_LOG=$(ls -t ~/.gemini/antigravity-cli/log/cli-*.log 2>/dev/null | head -1 || true)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROBE_SCRIPT="$SCRIPT_DIR/probe_proxy_api.sh"
 
-echo "▶ [步骤 1/3] 检查 AGY 最近一次启动时的 AICode 路由状态..."
-if [ -n "$LATEST_LOG" ] && [ -f "$LATEST_LOG" ]; then
-    echo "  正在分析日志: $(basename "$LATEST_LOG")"
-    
-    TIMEOUT_MATCH=$(grep -i "context deadline exceeded" "$LATEST_LOG" | grep -i "fetchConfig" || true)
-    SUCCESS_MATCH=$(grep -i "CCPA routed this account to AICode; serving AICode FetchConfig flags" "$LATEST_LOG" || true)
-    
-    if [ -n "$TIMEOUT_MATCH" ]; then
-        echo "  ❌ 【诊断异常】：存在 FetchConfig 超时 (context deadline exceeded)！"
-        echo "     日志内容: $TIMEOUT_MATCH"
-        echo "     说明: AGY 启动拉取实验特性超时，已自动回退降级到 CCPA 默认规则。"
-    elif [ -n "$SUCCESS_MATCH" ]; then
-        echo "  ✅ 【状态优秀】：AICode FetchConfig 已成功拉取并激活！"
-        echo "     日志内容: $SUCCESS_MATCH"
-    else
-        echo "  ℹ️  未在当前日志中捕获到明显的 FetchConfig 状态变更（可能为长期未重启进程）。"
-    fi
-else
-    echo "  ⚠️ 未找到 cli 日志文件。"
+OUTPUT_JSON=0
+if [[ "${1:-}" == "--json" ]]; then
+    OUTPUT_JSON=1
 fi
 
-echo ""
-echo "▶ [步骤 2/3] 测试 aicode.googleapis.com 当前网络握手与 DNS 延迟..."
+log_info() {
+    if [[ "$OUTPUT_JSON" -eq 0 ]]; then
+        echo "$*"
+    fi
+}
+
+# 检查核心依赖
+if ! command -v curl >/dev/null 2>&1; then
+    echo "Error: 'curl' is required but not installed." >&2
+    exit 1
+fi
+
+log_info "========================================================"
+log_info "    AGY & AICode 路由连通性与性能全自动诊断工具 v2.5"
+log_info "========================================================"
+
+# --- [步骤 1/4] 日志分析（扫描最近 3 个日志，按最后一次状态裁决） ---
+LOG_DIR="${AGY_LOG_DIR:-$HOME/.gemini/antigravity-cli/log}"
+LOG_STATUS="unknown"
+LOG_DETAIL=""
+LOG_FILE_USED=""
+
+if [[ -d "$LOG_DIR" ]]; then
+    # 安全获取最近 3 个日志文件
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+        LAST_EVENT=$(grep -iE "(context deadline exceeded.*fetchConfig|serving AICode FetchConfig flags)" "$file" | tail -n 1 || true)
+        if [[ -n "$LAST_EVENT" ]]; then
+            LOG_FILE_USED=$(basename "$file")
+            LOG_DETAIL="$LAST_EVENT"
+            if echo "$LAST_EVENT" | grep -qi "context deadline exceeded"; then
+                LOG_STATUS="degraded"
+            else
+                LOG_STATUS="healthy"
+            fi
+            break
+        fi
+    done < <(ls -t "$LOG_DIR"/cli-*.log 2>/dev/null | head -n 3 || true)
+fi
+
+log_info ""
+log_info "▶ [步骤 1/4] AGY 启动路由状态 ($LOG_FILE_USED)"
+case "$LOG_STATUS" in
+    degraded) log_info "  ❌ 【异常】最近一次 FetchConfig 超时降级: $LOG_DETAIL" ;;
+    healthy)  log_info "  ✅ 【优秀】AICode FetchConfig 已激活: $LOG_DETAIL" ;;
+    *)        log_info "  ℹ️  未在最近 3 个日志中捕获到 FetchConfig 事件。" ;;
+esac
+
+# --- [步骤 2/4] 网络握手探测（带超时熔断与 HTTP 状态校验） ---
 ENDPOINT="https://aicode.googleapis.com/v1alpha:fetchConfig"
-LATENCY_RESULT=$(curl -s -o /dev/null -w "HTTP %{http_code} | DNS: %{time_namelookup}s | Connect: %{time_connect}s | TLS: %{time_appconnect}s | Total: %{time_total}s\n" "$ENDPOINT" 2>&1 || true)
-echo "  探测结果: $LATENCY_RESULT"
+PROXY_ENV="${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-none}}}}"
 
-# 提取总耗时
-TOTAL_TIME=$(echo "$LATENCY_RESULT" | awk -F 'Total: ' '{print $2}' | sed 's/s//' | tr -d ' ')
-if [ -n "$TOTAL_TIME" ]; then
-    IS_SLOW=$(python3 -c "print(1 if float('$TOTAL_TIME') > 1.4 else 0)" 2>/dev/null || echo 0)
-    if [ "$IS_SLOW" -eq 1 ]; then
-        echo "  ⚠️ 当前握手总时延 ($TOTAL_TIME s) 接近或超过了 AGY 内置超时阈值 (~1.5s)！"
-        echo "     极易在高并发或冷启动时再次引发超时降级。"
+# 严格格式输出，加入 5 秒总超时和 3 秒连接超时
+METRICS=$(curl -sS -o /dev/null --connect-timeout 3 --max-time 5 \
+    -w "%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_total}" \
+    "$ENDPOINT" 2>/dev/null || echo "000|0|0|0|0")
+
+IFS='|' read -r HTTP_CODE T_DNS T_CONN T_TLS T_TOTAL <<< "$METRICS"
+
+NET_STATUS="error"
+if [[ "$HTTP_CODE" == "000" ]] || [[ -z "$HTTP_CODE" ]]; then
+    NET_STATUS="unreachable"
+else
+    # 使用 POSIX awk 替代 python3 进行浮点比较
+    IS_SLOW=$(awk -v t="$T_TOTAL" 'BEGIN { print (t + 0 > 1.4) ? 1 : 0 }')
+    if [[ "$IS_SLOW" -eq 1 ]]; then
+        NET_STATUS="slow"
     else
-        echo "  ✅ 当前网络时延在安全阈值以内 ($TOTAL_TIME s < 1.5s)。"
+        NET_STATUS="ok"
     fi
 fi
 
-echo ""
-echo "▶ [步骤 3/3] 检查代理与 DNS 环境 (Fake-IP / TUN 状态)..."
-RESOLVED_IP=$(dig aicode.googleapis.com +short 2>/dev/null || nslookup aicode.googleapis.com 2>/dev/null | grep 'Address' | tail -1 | awk '{print $2}' || true)
-echo "  当前域名解析到 IP: $RESOLVED_IP"
+log_info ""
+log_info "▶ [步骤 2/4] 握手与时延探测 (终端代理环境: $PROXY_ENV)"
+log_info "  结果: HTTP $HTTP_CODE | DNS: ${T_DNS}s | Connect: ${T_CONN}s | TLS: ${T_TLS}s | Total: ${T_TOTAL}s"
+case "$NET_STATUS" in
+    unreachable) log_info "  ❌ 【连接失败】无法触达 $ENDPOINT (HTTP 000，请检查代理节点或网络连通性)。" ;;
+    slow)        log_info "  ⚠️ 【时延过高】总耗时 ${T_TOTAL}s 接近或超过 1.5s 安全阈值，极易触发降级。" ;;
+    ok)          log_info "  ✅ 【时延健康】总耗时 ${T_TOTAL}s (< 1.4s 安全线)。" ;;
+esac
 
-if [[ "$RESOLVED_IP" =~ ^198\.18\. ]]; then
-    echo "  💡 检测到当前处于 Fake-IP (198.18.0.0/15) 网段。"
-    echo "     如果此域名此前发生过握手超时，建议确保该域名在 Clash/Surge 中已配置 fake-ip-filter 绕过解析。"
+# --- [步骤 3/4] 跨平台 DNS 与 Fake-IP 归因 ---
+resolve_ips() {
+    local host="$1"
+    if command -v dig >/dev/null 2>&1; then
+        dig +short "$host" A "$host" AAAA 2>/dev/null | grep -E '^[0-9a-fA-F:.]+$' || true
+    elif command -v getent >/dev/null 2>&1; then
+        getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u || true
+    elif command -v nslookup >/dev/null 2>&1; then
+        nslookup "$host" 2>/dev/null | awk '/^Address: / {print $2}' || true
+    fi
+}
+
+RESOLVED_IPS=$(resolve_ips "aicode.googleapis.com" | tr '\n' ' ' | sed 's/ $//')
+DNS_MODE="unknown"
+
+if [[ -z "$RESOLVED_IPS" ]]; then
+    DNS_MODE="failed"
+elif echo "$RESOLVED_IPS" | grep -qE '(^| )(198\.1[89]\.|fc00:)'; then
+    DNS_MODE="fake-ip"
 else
-    echo "  ✅ 当前域名已直接解析为真实外部 IP 或直连解析通道。"
+    DNS_MODE="real-ip"
 fi
 
-echo ""
-echo "========================================================"
-echo "诊断结束。"
-echo "========================================================"
+log_info ""
+log_info "▶ [步骤 3/4] 系统 DNS 解析状态"
+log_info "  解析 IP 列表: ${RESOLVED_IPS:-无}"
+case "$DNS_MODE" in
+    fake-ip) log_info "  💡 检测到 Fake-IP 网段 (198.18.0.0/15 或 fc00::/18)。" ;;
+    real-ip) log_info "  ✅ 已解析为真实 IP（请确保代理已开启 Sniffer 嗅探且上游 DNS 无污染）。" ;;
+    failed)  log_info "  ❌ DNS 解析失败，请检查本地 DNS 服务。" ;;
+esac
+
+# --- [步骤 4/4] 本地代理控制面白盒透视（只读、静默降级） ---
+PROXY_PROBE_JSON='{"status":"unavailable","client":"none","endpoint":"","mode":"unknown","target_domain":"aicode.googleapis.com","matched_rule":"","policy_chain":[],"active_node":{"name":"","type":"","delay_ms":-1},"alternatives":[]}'
+
+log_info ""
+log_info "▶ [步骤 4/4] 代理控制面白盒透视 (Clash/Mihomo/Surge)"
+if [[ -f "$PROBE_SCRIPT" ]]; then
+    if [[ "$OUTPUT_JSON" -eq 1 ]]; then
+        PROXY_PROBE_JSON=$(bash "$PROBE_SCRIPT" --json 2>/dev/null || echo "$PROXY_PROBE_JSON")
+    else
+        bash "$PROBE_SCRIPT" || true
+    fi
+else
+    log_info "  ℹ️  未发现探针脚本 ($PROBE_SCRIPT)，跳过白盒透视。"
+fi
+
+# JSON 结构化输出模式（专供 AGY Agent 消费）
+if [[ "$OUTPUT_JSON" -eq 1 ]]; then
+    cat <<EOF
+{
+  "log_status": "$LOG_STATUS",
+  "log_file": "$LOG_FILE_USED",
+  "proxy_env": "$PROXY_ENV",
+  "network": {
+    "status": "$NET_STATUS",
+    "http_code": "$HTTP_CODE",
+    "dns_s": $T_DNS,
+    "connect_s": $T_CONN,
+    "tls_s": $T_TLS,
+    "total_s": $T_TOTAL
+  },
+  "dns": {
+    "mode": "$DNS_MODE",
+    "ips": "$RESOLVED_IPS"
+  },
+  "proxy_control_plane": $PROXY_PROBE_JSON
+}
+EOF
+fi

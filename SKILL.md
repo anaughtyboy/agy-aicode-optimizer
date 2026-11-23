@@ -1,86 +1,138 @@
 ---
 name: agy-aicode-optimizer
-description: AGY CLI & Google AICode 路由优化与诊断技能。排查 Gemini/Claude 在 agy 中响应缓慢、FetchConfig 超时降级、DNS/Fake-IP 延迟等问题，并提供一键诊断脚本、Clash/Surge DNS 优化方案与前后效果基准对比。
+description: Google Antigravity CLI (agy) 与 Google AICode 路由性能诊断及调优技能。当用户反馈 agy 启动卡顿、Gemini/Claude 响应异常缓慢、日志出现 FetchConfig 超时 (context deadline exceeded) 或 CCPA 路由降级、以及排查代理 TUN/Fake-IP 延迟问题时触发。
 ---
 
-# AGY & Google AICode 路由性能调优指南 (agy-aicode-optimizer)
+# AGY & Google AICode 路由诊断与调优 SOP
 
-本技能用于诊断与修复 Google Antigravity CLI (`agy`) 在使用 Gemini（尤其是带 Thinking Effort 的模型）时出现的**启动迟钝、路由回退降级（FetchConfig 超时）以及请求延迟过大**等问题。
+本技能用于排查并修复 `agy` 启动时请求 `aicode.googleapis.com` 拉取实验配置（`FetchConfig`）因超过 **~1.5 秒**阈值而触发 CCPA 降级回退的问题。
 
----
+## Agent 标准执行协议（SOP）
 
-## 流程一：思考与响应缓慢的原因诊断
+面对用户的性能或卡顿反馈，**必须严格按以下顺序执行，严禁跳过诊断直接盲推配置**：
 
-当在 `agy` 中使用 `Gemini 3.8 Flash (High)` 或其他模型感觉极度缓慢时，核心原因通常分为两层：
-
-### 1. 客户端网络/路由回退（可本地优化）
-- **FetchConfig 超时降级**：
-  AGY 启动时会请求 `https://aicode.googleapis.com/v1alpha:fetchConfig` 拉取最新实验特性及 Mendel 路由策略。
-  > [!WARNING]
-  > AGY 客户端对该配置拉取设置了极其严苛的超时阈值（约 **1.5 秒**）。
-  > 在使用代理软件（如 Clash、Surge 等）的 TUN + Fake-IP 模式时，冷启动的 DNS 劫持与 TLS 多次握手极易突破 1.5s，触发：
-  > `CCPA routed this account to AICode, but AICode FetchConfig failed, serving CCPA's flags: context deadline exceeded`
-  > 此时客户端回退至旧的 `daily-cloudcode-pa` 默认策略，失去服务端的优化特性。
-
-### 2. 服务端与上下文因素（理解机制）
-- **长思维链前摇**：`High Thinking Effort` 下模型会先推理并产生数千字思考 Token，在输出第一段可见内容前需要数秒思考时间。
-- **长上下文预填充**：会话进行到较长轮次（例如达到 8 万 ~ 20 万 Token）时，注意力计算开销上升。
-
----
-
-## 流程二：自动化一键诊断工具
-
-运行本技能内置的诊断脚本，自动分析当前 AGY 状态、网络连通性及 DNS 模式：
-
-```bash
-~/.gemini/skills/agy-aicode-optimizer/scripts/diagnose.sh
-```
-
-脚本将自动检查：
-1. **启动日志**：是否存在 `context deadline exceeded` 降级记录。
-2. **握手时延**：`aicode.googleapis.com` 的 TLS/Total 连接时延是否在 1.5s 安全线内。
-3. **DNS 状态**：是否处于 Fake-IP 网段或已成功走直连真实 IP 解析。
+1. **执行结构化诊断**：定位本 Skill 所在目录下的 `scripts/diagnose.sh`（使用相对路径定位，禁止硬编码绝对路径），执行：
+   ```bash
+   bash scripts/diagnose.sh --json
+   ```
+2. **基于 JSON 事实归因**：
+   - **优先核验白盒控制面（若 `proxy_control_plane.status == "ok"`）**：
+     - 直接提取 `matched_rule`、`policy_chain`、当前物理节点 `active_node` 与测速延迟，向用户点明当前分流事实，杜绝模糊推测；
+     - 若 `proxy_control_plane.status == "unauthorized"`，顺带提示用户：导出 `CLASH_SECRET` / `MIHOMO_SECRET` 或 `SURGE_API_KEY` 可开启白盒透视；
+     - 若为 `"unavailable"`，静默依赖黑盒指标继续诊断，不报错、不打断流程。
+   - **结合决策矩阵**：依据返回字段向用户汇报明确结论。
+3. **确认代理栈并精准输出**：若判定为网络/DNS 链路问题，先确认用户使用的代理客户端（Clash/Mihomo、Surge、Sing-box 或其他），仅输出对应客户端的闭环配置。
+4. **验证提醒**：明确告知用户修改配置后需**完全退出并重启 `agy` 进程**，再重新运行诊断脚本验证。
 
 ---
 
-## 流程三：需要优化的 DNS 与代理配置
+## 诊断结果决策矩阵
 
-为了将连接时延压缩在 1.5s 内，避免 AGY 启动时触发回退，需要在代理软件中为 Google 接口配置 **Fake-IP 过滤**与**预解析优化**。
+| JSON 关键字段条件 | 根因判定 | 建议动作 |
+| :--- | :--- | :--- |
+| `network.status == "unreachable"` | 代理断连、节点不可用或终端代理变量异常 | 检查 `proxy_env` 及本地代理连通性，排除基础断网后再做路由优化 |
+| `proxy_control_plane.status == "ok"` 且 `matched_rule` 包含 `MATCH` / `FINAL` / `DIRECT` | **分流规则漏命中**（绕过 Fake-IP 后未开 sniffer 嗅探，或缺少规则） | 明确指出流量掉入了兜底规则或直连；要求补全精准 `DOMAIN` 规则并开启 TLS SNI 嗅探 |
+| `proxy_control_plane.active_node.delay_ms > 400` 且 `alternatives` 非空 | **当前物理节点高延迟** | 直接报出当前节点名与延迟，并列出 `alternatives` 中同组更优备选节点建议用户手动切换 |
+| `proxy_control_plane.active_node.name` 命中高风险/非支持地区关键词（如 `HK` / `RU` / `CN`） | **地区路由不兼容或绕路风险** | 提示 Google AICode / Gemini 在该区域可能存在可用性限制或额外中转跳数，建议切换至美区（US）、新加坡（SG）或日本（JP）优质节点 |
+| `proxy_control_plane.mode == "direct"` | **代理处于全局直连模式** | 提示代理内核当前为 direct 模式，需切回 rule 模式 |
+| `log_status == "degraded"` 或 `network.status == "slow"` (`total_s > 1.4`)，且 `dns.mode == "fake-ip"` | **典型 Fake-IP 握手超时降级** | 为核心域名配置 Fake-IP 绕过 + SNI 嗅探 + 防污染 DoH，并确保走低延迟节点 |
+| `network.status == "slow"` 且 `dns.mode == "real-ip"` | 节点延迟过高、多跳链路震荡或上游 DNS 慢 | 切换低延迟美区/新加坡优质节点，检查 `dns_s` 与 `tls_s` 耗时占比 |
+| `log_status == "healthy"` 且 `network.status == "ok"` | **网络与路由健康**，非客户端降级导致 | 向用户解释模型机制：高推理等级（High Thinking Effort）的长思维链前摇或长上下文（80k+ Token）预填充耗时 |
+| `dns.mode == "failed"` | 本地 DNS 解析服务异常 | 检查代理内核 DNS 模块是否正常运行 |
 
-### 1. Clash / Mihomo 配置
-在 `dns` 模块下的 `fake-ip-filter` 中加入相关域名，使其不分配 Fake-IP（避免额外的 TUN 劫持和反查时延）：
+---
+
+## 核心优化域名清单
+
+为避免通配符（如 `*.googleapis.com`）引发过宽的规则副作用，仅精确收敛以下关键域名：
+
+* `aicode.googleapis.com`（FetchConfig 配置与 Mendel 路由）
+* `cloudcode-pa.googleapis.com`（CCPA 生产端点）
+* `daily-cloudcode-pa.googleapis.com`（CCPA 预发/降级端点）
+* `oauth2.googleapis.com`（OAuth Token 续签）
+
+---
+
+## 代理客户端闭环调优方案
+
+> [!IMPORTANT]
+> **架构前提**：在 TUN 模式下绕过 Fake-IP 后，内核仅可见目标 IP。因此配置必须同时满足三要素：**绕过 Fake-IP** + **开启 TLS SNI 嗅探（防止域名规则失效）** + **指定海外防污染 DNS（防止本地解析污染）**。
+
+### 1. Clash / Mihomo
 
 ```yaml
+sniffer:
+  enable: true
+  sniff:
+    TLS:
+      ports: [443]
+
 dns:
   enable: true
   enhanced-mode: fake-ip
   fake-ip-filter:
     - 'aicode.googleapis.com'
+    - 'cloudcode-pa.googleapis.com'
     - 'daily-cloudcode-pa.googleapis.com'
-    - '*.googleapis.com'
-```
+    - 'oauth2.googleapis.com'
+  nameserver-policy:
+    '+.googleapis.com':
+      - 'https://1.1.1.1/dns-query'
+      - 'https://8.8.8.8/dns-query'
 
-### 2. 分流规则推荐
-确保上述域名走稳定低延迟的代理节点（如美区优质节点），避免触发多次节点跳转与延迟震荡：
-
-```yaml
 rules:
   - DOMAIN,aicode.googleapis.com,PROXY
-  - DOMAIN-SUFFIX,googleapis.com,PROXY
+  - DOMAIN,cloudcode-pa.googleapis.com,PROXY
+  - DOMAIN,daily-cloudcode-pa.googleapis.com,PROXY
+  - DOMAIN,oauth2.googleapis.com,PROXY
 ```
 
----
+### 2. Surge
 
-## 流程四：优化前后效果对比验证
+```ini
+[General]
+always-real-ip = aicode.googleapis.com, cloudcode-pa.googleapis.com, daily-cloudcode-pa.googleapis.com, oauth2.googleapis.com
 
-以当前排查与诊断的实际交互会话（会话 ID `0922aa24-1a4a-444d-a943-b68f4c1b52b3`，包含全套排查过程、长思维模型交互与多次工具调用）为例：
+[Rule]
+DOMAIN,aicode.googleapis.com,PROXY
+DOMAIN,cloudcode-pa.googleapis.com,PROXY
+DOMAIN,daily-cloudcode-pa.googleapis.com,PROXY
+DOMAIN,oauth2.googleapis.com,PROXY
+```
 
-| 评估维度 | 优化前 (DNS 未调优 / Fake-IP 劫持) | 优化后 (加入过滤直连解析 / 握手缩减) |
-| :--- | :--- | :--- |
-| **启动 FetchConfig 状态** | ❌ 报错 `context deadline exceeded`，降级为默认 flags | ✅ 成功 `serving AICode FetchConfig flags after 1.312s` |
-| **API 握手总时延 (TLS + HTTP)** | ~1.5s ~ 2.1s (易偶发超时降级) | **0.97s** (稳定进入安全阈值以内) |
-| **DNS 解析方式** | 虚假 IP 网段 (`198.18.0.x`) | 真实 Google IP (`172.217.x.x`) |
-| **Gemini 3.8 Flash (High) 交互耗时** | 握手卡顿，等待超时回退，波动明显 | **0~1 秒** 极速完成生成响应（多次步骤 0.0s~1.0s 即时返回） |
+### 3. Sing-box
 
-> [!TIP]
-> 修改完代理配置后，需**完全退出并重启 AGY CLI**，才能使 AGY 在新进程启动时以优化后的网络链路完成首次 FetchConfig 握手。
+```json
+{
+  "dns": {
+    "rules": [
+      {
+        "domain": [
+          "aicode.googleapis.com",
+          "cloudcode-pa.googleapis.com",
+          "daily-cloudcode-pa.googleapis.com",
+          "oauth2.googleapis.com"
+        ],
+        "server": "remote_doh"
+      }
+    ]
+  },
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "domain": [
+          "aicode.googleapis.com",
+          "cloudcode-pa.googleapis.com",
+          "daily-cloudcode-pa.googleapis.com",
+          "oauth2.googleapis.com"
+        ],
+        "outbound": "proxy"
+      }
+    ]
+  }
+}
+```
+*(注：请将 `remote_doh` 与 `proxy` 替换为实际配置中的海外 DoH DNS 节点与代理出站标签。)*
